@@ -126,6 +126,13 @@ class ParallelEmbedding(nn.Module):
 
         # -------------------------------------------------------------
         # How many vocabulary tokens THIS GPU is responsible for?
+
+        # Split the embedding matrix across GPUs:
+        #
+        # GPU0 → tokens [0, 25k)
+        # GPU1 → tokens [25k, 50k)
+        # GPU2 → tokens [50k, 75k)
+        # GPU3 → tokens [75k, 100k)
         #
         # Example:
         #   vocab_size = 100k, world_size = 4

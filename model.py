@@ -251,3 +251,68 @@ class ParallelEmbedding(nn.Module):
             dist.all_reduce(y)
 
         return y
+
+
+
+def linear(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+    scale_fmt: Optional[str] = None
+) -> torch.Tensor:
+    """
+    Apply a linear transformation: y = x * W^T + b.
+
+    This function automatically selects the appropriate GEMM backend depending
+    on tensor formats (e.g., FP8, BF16) and quantization state.
+
+    Args:
+        x (torch.Tensor):
+            Input activation tensor.
+        weight (torch.Tensor):
+            Weight matrix, possibly quantized (e.g., FP8 with element_size() == 1).
+        bias (Optional[torch.Tensor], optional):
+            Optional bias to add to the output. Defaults to None.
+        scale_fmt (Optional[str], optional):
+            Optional scaling format used for FP8 activation quantization.
+
+    Returns:
+        torch.Tensor:
+            Output tensor after applying linear transformation using the appropriate
+            GEMM implementation.
+
+    Execution Paths:
+        1. **Unquantized weights (FP16/BF16/FP32)**
+                → Uses standard `torch.nn.functional.linear`.
+
+        2. **Quantized weights + BF16 GEMM**
+                → Dequantizes weights, then calls standard BF16 linear.
+
+        3. **Quantized weights + FP8 GEMM**
+                → Quantizes activations using `act_quant`
+                → Computes matrix multiplication using `fp8_gemm`
+                → Adds bias if provided
+    """
+    # Case 1: Weight not quantized (standard FP16/FP32/BF16)
+    if weight.element_size() > 1:
+        return F.linear(x, weight, bias)
+
+    # Case 2: Quantized weights but BF16 GEMM is requested
+    elif gemm_impl == "bf16":
+        weight = weight_dequant(weight, weight.scale)
+        return F.linear(x, weight, bias)
+
+    # Case 3: FP8 GEMM path (quantized weights + fp8_gemm)
+    else:
+        # Quantize activations (x → FP8)
+        x_fp8, x_scale = act_quant(x, block_size, scale_fmt)
+
+        # GEMM using FP8 inputs and scales
+        y = fp8_gemm(x_fp8, x_scale, weight, weight.scale)
+
+        # Add bias (if provided)
+        if bias is not None:
+            y += bias
+
+        return y
+

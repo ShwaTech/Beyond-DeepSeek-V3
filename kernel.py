@@ -304,6 +304,7 @@ def weight_dequant_kernel(x_ptr, s_ptr, y_ptr, M, N, BLOCK_SIZE: tl.constexpr):
     tl.store(y_ptr + offs, y, mask=mask)
 
 
+
 # =======================================
 # Weight Dequantization Function
 # =======================================
@@ -381,3 +382,43 @@ def weight_dequant(x: torch.Tensor, s: torch.Tensor, block_size: int = 128) -> t
     # 6. Return Full Dequantized Matrix
     # ----------------------------------------------------------------------
     return y
+
+
+
+# ------------------------------------------------------------------------------
+# fp8_gemm_configs:
+# A list of candidate kernel configurations for FP8 GEMM autotuning.
+#
+# DeepSeek creates MANY configurations varying:
+#   - BLOCK_SIZE_M (tile height)
+#   - BLOCK_SIZE_N (tile width)
+#   - BLOCK_SIZE_K (inner dimension tile size)
+#   - num_stages   (pipeline depth for software prefetching)
+#   - num_warps    (# of warps per Triton program instance)
+#
+# Triton’s autotuner will benchmark these to pick the fastest kernel on your GPU.
+# ------------------------------------------------------------------------------
+fp8_gemm_configs = [
+    Config(
+        # Kernel tile parameters:
+        {
+            'BLOCK_SIZE_M': block_m,  # How many output rows this kernel tile computes
+            'BLOCK_SIZE_N': block_n,  # How many output columns this tile computes
+            'BLOCK_SIZE_K': 128       # Tile size along the reduction dimension K (fixed)
+        },
+        num_stages=num_stages,  # Pipeline depth: 3..6 async load stages
+        num_warps=8             # Number of warps executing the kernel (parallelism)
+    )
+
+    # --------------------------------------------------------------------------
+    # Cartesian product:
+    #   block_m in [16, 32, 64]
+    #   block_n in [32, 64, 128]
+    #   num_stages in [3, 4, 5, 6]
+    #
+    # This produces 3 × 3 × 4 = 36 unique kernel configurations.
+    # --------------------------------------------------------------------------
+    for block_m in [16, 32, 64]       # Tile height options
+    for block_n in [32, 64, 128]      # Tile width options
+    for num_stages in [3, 4, 5, 6]    # Prefetch pipeline depth (latency hiding)
+]

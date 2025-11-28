@@ -655,3 +655,169 @@ class RMSNorm(nn.Module):
             self.eps       # Numerical stability
         )
 
+
+
+def precompute_freqs_cis(args: ModelArgs) -> torch.Tensor:
+    """
+    Precompute the complex-valued rotary frequencies (cis = cos + i·sin) used in
+    DeepSeek-V3’s improved RoPE mechanism.
+
+    DeepSeek-V3 uses a *corrected*, *multi-scale*, and *extrapolation-safe*
+    version of Rotary Positional Embeddings (RoPE). This enhanced formulation
+    fixes the classic problem that RoPE breaks when sequence length exceeds the
+    length used during training.
+
+    This function performs four key steps:
+
+    1) Build base inverse-frequency RoPE spectrum:
+        freq[i] = 1 / base^(i/dim)
+
+    2) If the current sequence length exceeds the training-time limit,
+        compute correction bands based on:
+            - β_fast : rotations that drift fastest (high-frequency heads)
+            - β_slow : rotations that drift slowly (low-frequency heads)
+
+    3) Apply DeepSeek-V3’s “Smooth RoPE Scaling”:
+        - Uses a *ramping mask* that linearly blends between:
+            • original frequencies (trained range)
+            • scaled frequencies (extrapolation range)
+
+    4) Convert raw angular frequencies into complex exponentials:
+        cis(θ) = cos(θ) + i⋅sin(θ)
+
+        This lets the attention rotate Q and K vectors using fast,
+        element-wise complex multiplication.
+
+    Returns:
+        torch.Tensor of shape (seqlen, dim/2)
+            Complex cis values used for rotating (q, k) vectors during attention.
+    """
+
+    # Dimension of each head affected by RoPE (only half gets sin/cos pairs)
+    dim = args.qk_rope_head_dim
+
+    # Maximum sequence length we want to support at runtime
+    seqlen = args.max_seq_len
+
+    # DeepSeek-V3 multi-scale extrapolation parameters
+    beta_fast = args.beta_fast     # high-frequency correction threshold
+    beta_slow = args.beta_slow     # low-frequency correction threshold
+
+    # Classical RoPE hyperparameters
+    base = args.rope_theta         # usually 10_000 but tunable
+    factor = args.rope_factor      # scaling factor used during extrapolation
+
+    # -------------------------------------------------------------------------
+    # Helper: Compute which RoPE dimension corresponds to a given number of
+    #         complete positional rotations over the training sequence length.
+    #
+    # The RoPE frequency grows exponentially with dimension index:
+    #     freq[k] ≈ base^(-k/dim)
+    #
+    # The number of rotations over the original training window is:
+    #     rotations = seq_len * freq
+    #
+    # We solve for k (dimension index) such that rotations == desired_rot
+    # -------------------------------------------------------------------------
+    def find_correction_dim(num_rotations, dim, base, max_seq_len):
+        """
+        Solve for the RoPE dimension index 'k' that produces a target number
+        of rotations over the training sequence window.
+
+        This is derived from:
+            num_rot = seq_len * base^(-k/dim)
+            -> solve for k
+        """
+        return dim * math.log(max_seq_len / (num_rotations * 2 * math.pi)) / (2 * math.log(base))
+
+    # -------------------------------------------------------------------------
+    # Helper: Compute the low/high dimension indices whose frequencies lie
+    #         between β_fast and β_slow rotations. These boundaries define the
+    #         "correction band" where smoothing is applied.
+    # -------------------------------------------------------------------------
+    def find_correction_range(low_rot, high_rot, dim, base, max_seq_len):
+        """
+        Find frequency band indices that require extrapolation correction.
+        Returns (low_idx, high_idx) clamped to valid range.
+        """
+        low = math.floor(find_correction_dim(low_rot, dim, base, max_seq_len))
+        high = math.ceil(find_correction_dim(high_rot, dim, base, max_seq_len))
+        return max(low, 0), min(high, dim - 1)
+
+    # -------------------------------------------------------------------------
+    # Helper: Compute a smooth ramping mask from 0 → 1 between two dimensions.
+    #
+    # Used to softly blend RoPE frequencies:
+    #     blended = corrected_freq * (1 - smooth) + original_freq * smooth
+    #
+    # This avoids sudden discontinuities in rotation rates.
+    # -------------------------------------------------------------------------
+    def linear_ramp_factor(min, max, dim):
+        """
+        Linearly interpolate from 0 to 1 between indices [min, max].
+        Clamped outside the range.
+
+        Example:
+            min=20, max=50, dim=100 produces a 100-length vector where:
+                [0..20] → 0
+                [20..50] → linear ramp 0 → 1
+                [50..] → 1
+        """
+        if min == max:
+            # Prevent division by zero
+            max += 0.001
+
+        linear = (torch.arange(dim, dtype=torch.float32) - min) / (max - min)
+        return torch.clamp(linear, 0, 1)
+
+    # =========================================================================
+    # Step 1 — Compute base inverse frequencies (standard RoPE)
+    # =========================================================================
+    # RoPE uses frequencies 1 / base^(i/dim) applied to (sin, cos) pairs.
+    freqs = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+
+    # =========================================================================
+    # Step 2 — If we are *extrapolating* beyond the trained seq length,
+    #          apply DeepSeek-V3 RoPE frequency corrections.
+    # =========================================================================
+    if seqlen > args.original_seq_len:
+        # Determine the correction band for extrapolation safety
+        low, high = find_correction_range(
+            beta_fast,            # high-frequency behavior (fast drift)
+            beta_slow,            # low-frequency behavior (slow drift)
+            dim,
+            base,
+            args.original_seq_len
+        )
+
+        # Smooth transition mask between corrected and original frequencies
+        # Shape: (dim/2,)
+        smooth = 1 - linear_ramp_factor(low, high, dim // 2)
+
+        # Apply DeepSeek-V3’s multi-scale RoPE correction:
+        #   - Low-frequency dims receive small correction
+        #   - High-frequency dims remain original
+        freqs = (
+            freqs / factor * (1 - smooth) +  # corrected (scaled) frequencies
+            freqs * smooth                   # original frequencies
+        )
+
+    # =========================================================================
+    # Step 3 — Build time-indexed angles θ = t * freq
+    # =========================================================================
+    t = torch.arange(seqlen)                    # [0 .. L-1]
+    freqs = torch.outer(t, freqs)               # shape: (L, dim/2)
+
+    # =========================================================================
+    # Step 4 — Convert to complex exponential representation:
+    #         cis(θ) = cos(θ) + i⋅sin(θ)
+    #
+    # This enables Q and K rotation with:
+    #       q_rot = q * cis
+    #       k_rot = k * cis
+    #
+    # where * is complex multiply (implemented via real operations).
+    # =========================================================================
+    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
+
+    return freqs_cis

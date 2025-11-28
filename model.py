@@ -431,7 +431,6 @@ class ColumnParallelLinear(Linear):
         dtype (optional):
             Data type for storing weights (FP8/BF16/etc.).
     """
-
     def __init__(
         self,
         in_features: int,

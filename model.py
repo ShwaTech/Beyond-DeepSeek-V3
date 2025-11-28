@@ -892,3 +892,280 @@ def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
 
     # Restore original dtype and return
     return y.to(dtype)
+
+
+
+class MLA(nn.Module):
+    """
+    Multi-Head Latent Attention (MLA)
+
+    MLA is a **factorized-attention mechanism** designed to reduce compute and memory
+    cost while preserving the expressive power of multi-head attention.
+
+    Unlike standard attention, MLA:
+        • Splits Q/K into "NOPE" (non-positional) and "ROPE" (rotary) subspaces.
+        • Uses **low-rank LoRA-style projections** for queries and key/value bases.
+        • Stores a compressed representation (kv_lora_rank) for keys/values and only
+          expands to full Q/K/V when needed.
+        • Supports tensor parallelism via ColumnParallelLinear & RowParallelLinear.
+        • Uses two possible attention paths:
+            - "naive": standard full-feature attention
+            - fused MLA: latent space attention using compressed caches
+
+    Attributes:
+        dim: Input hidden dimension.
+        n_heads: Total number of attention heads.
+        n_local_heads: Heads handled by this device under tensor parallelism.
+        q_lora_rank: Low-rank dimension for query factorization.
+        kv_lora_rank: Low-rank dimension for key/value compression.
+        qk_nope_head_dim: Non-positional Q/K head dimension.
+        qk_rope_head_dim: Rotational Q/K head dimension (RoPE).
+        v_head_dim: Value head dimension.
+        qk_head_dim: Total Q/K dimension = NOPE + ROPE.
+        softmax_scale: Scaling factor for Q·Kᵀ / sqrt(d) stabilization.
+    """
+
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+
+        # ------------------------------
+        # Core architectural parameters
+        # ------------------------------
+        self.dim = args.dim
+        self.n_heads = args.n_heads
+        self.n_local_heads = args.n_heads // world_size
+
+        # Low-rank parameters (LoRA-style)
+        self.q_lora_rank = args.q_lora_rank
+        self.kv_lora_rank = args.kv_lora_rank
+
+        # Q/K feature splitting (NOPE vs ROPE)
+        self.qk_nope_head_dim = args.qk_nope_head_dim
+        self.qk_rope_head_dim = args.qk_rope_head_dim
+        self.qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
+
+        # Value head dimension
+        self.v_head_dim = args.v_head_dim
+
+        # -----------------------------------------------------
+        # Query projection:
+        #   Option A: Direct full Q = xW
+        #   Option B: Low-rank Q = Wq_a(x) → RMSNorm → Wq_b
+        # -----------------------------------------------------
+        if self.q_lora_rank == 0:
+            # Direct projection, column-parallel: output spreads across devices
+            self.wq = ColumnParallelLinear(self.dim, self.n_heads * self.qk_head_dim)
+        else:
+            # Low-rank factorization
+            self.wq_a = Linear(self.dim, self.q_lora_rank)     # Down-project
+            self.q_norm = RMSNorm(self.q_lora_rank)            # Normalization in latent space
+            self.wq_b = ColumnParallelLinear(
+                self.q_lora_rank, 
+                self.n_heads * self.qk_head_dim                # Up-project to full Q dimension
+            )
+
+        # -----------------------------------------------------
+        # Key/Value low-rank base projection:
+        #   wkv_a → produces:
+        #       kv_lora_rank (latent K/V bases)
+        #       qk_rope_head_dim (ROPE positional K component)
+        # -----------------------------------------------------
+        self.wkv_a = Linear(self.dim, self.kv_lora_rank + self.qk_rope_head_dim)
+        self.kv_norm = RMSNorm(self.kv_lora_rank)
+
+        # Expand latent K/V into:
+        #   NOPE K + V   (per-head)
+        self.wkv_b = ColumnParallelLinear(
+            self.kv_lora_rank,
+            self.n_heads * (self.qk_nope_head_dim + self.v_head_dim)
+        )
+
+        # Output projection: merges all heads
+        self.wo = RowParallelLinear(self.n_heads * self.v_head_dim, self.dim)
+
+        # Softmax scaling
+        self.softmax_scale = self.qk_head_dim ** -0.5
+
+        # Rescaling for extended RoPE (long sequence correction)
+        if args.max_seq_len > args.original_seq_len:
+            mscale = 0.1 * args.mscale * math.log(args.rope_factor) + 1.0
+            self.softmax_scale *= mscale * mscale
+
+        # -----------------------------------------------------
+        # Cache buffers for incremental generation
+        # -----------------------------------------------------
+        if attn_impl == "naive":
+            # Full expanded cache per head
+            self.register_buffer(
+                "k_cache",
+                torch.zeros(args.max_batch_size, args.max_seq_len, self.n_local_heads, self.qk_head_dim),
+                persistent=False
+            )
+            self.register_buffer(
+                "v_cache",
+                torch.zeros(args.max_batch_size, args.max_seq_len, self.n_local_heads, self.v_head_dim),
+                persistent=False
+            )
+        else:
+            # Compressed latent caches (much smaller)
+            self.register_buffer(
+                "kv_cache",
+                torch.zeros(args.max_batch_size, args.max_seq_len, self.kv_lora_rank),
+                persistent=False
+            )
+            self.register_buffer(
+                "pe_cache",
+                torch.zeros(args.max_batch_size, args.max_seq_len, self.qk_rope_head_dim),
+                persistent=False
+            )
+
+    # ====================
+    # Forward Pass
+    # ====================
+    def forward(self, x: torch.Tensor, start_pos: int, freqs_cis: torch.Tensor, mask: Optional[torch.Tensor]):
+        """
+        Args:
+            x (Tensor): Input of shape (B, S, dim).
+            start_pos (int): Starting position for writing into cache.
+            freqs_cis (Tensor): Precomputed rotary position frequencies.
+            mask (Tensor or None): Causal / padding mask.
+
+        Returns:
+            Tensor of shape (B, S, dim)
+        """
+        bsz, seqlen, _ = x.size()
+        end_pos = start_pos + seqlen
+
+        # ============================================================================
+        # 1. Compute Q (with optional low-rank factorization)
+        # ============================================================================
+        if self.q_lora_rank == 0:
+            q = self.wq(x)    # (B, S, n_heads * qk_dim)
+        else:
+            q_low = self.wq_a(x)           # Down-project
+            q_low = self.q_norm(q_low)
+            q = self.wq_b(q_low)           # Up-project
+
+        # Reshape into multi-head format
+        q = q.view(bsz, seqlen, self.n_local_heads, self.qk_head_dim)
+
+        # Split into NOPE positional & ROPE positional components
+        q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+
+        # Apply RoPE rotation to q_pe
+        q_pe = apply_rotary_emb(q_pe, freqs_cis)
+
+        # ============================================================================
+        # 2. Compute K/V low-rank bases from wkv_a
+        # ============================================================================
+        kv = self.wkv_a(x)
+
+        # Split into:
+        #   kv  → latent K/V base     (kv_lora_rank)
+        #   k_pe → positional K       (qk_rope_head_dim)
+        kv, k_pe = torch.split(kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+
+        # Apply RoPE to positional keys
+        # (unsqueeze head dim temporarily for correct broadcasting)
+        k_pe = apply_rotary_emb(k_pe.unsqueeze(2), freqs_cis)
+
+        # ============================================================================
+        # 3. Attention path A: Naive full-dimensional attention
+        # ============================================================================
+        if attn_impl == "naive":
+
+            # Combine Q = [q_nope | q_pe]
+            q_full = torch.cat([q_nope, q_pe], dim=-1)
+
+            # Expand latent K/V using wkv_b
+            kv_expanded = self.wkv_b(self.kv_norm(kv))        # (B, S, n_heads*(nope_dim + vdim))
+            kv_expanded = kv_expanded.view(
+                bsz, seqlen, self.n_local_heads,
+                self.qk_nope_head_dim + self.v_head_dim
+            )
+
+            # Split expanded key/value
+            k_nope, v = torch.split(
+                kv_expanded,
+                [self.qk_nope_head_dim, self.v_head_dim],
+                dim=-1
+            )
+
+            # Combine K = [k_nope | k_pe]
+            k = torch.cat([k_nope, k_pe.expand(-1, -1, self.n_local_heads, -1)], dim=-1)
+
+            # Save into cache for autoregressive decoding
+            self.k_cache[:bsz, start_pos:end_pos] = k
+            self.v_cache[:bsz, start_pos:end_pos] = v
+
+            # Compute attention scores = Q·Kᵀ
+            scores = torch.einsum("bshd,bthd->bsht", q_full, self.k_cache[:bsz, :end_pos])
+            scores = scores * self.softmax_scale
+
+        # ============================================================================
+        # 4. Attention path B: Fused MLA (latent space attention)
+        # ============================================================================
+        else:
+            # -----------------------------------------------
+            # Load dequantized weight for wkv_b if needed
+            # -----------------------------------------------
+            if self.wkv_b.scale is None:
+                wkv_b = self.wkv_b.weight
+            else:
+                wkv_b = weight_dequant(self.wkv_b.weight, self.wkv_b.scale, block_size)
+
+            # Reshape to per-head blocks
+            #   (n_local_heads, out_features_per_head, kv_lora_rank)
+            wkv_b = wkv_b.view(self.n_local_heads, -1, self.kv_lora_rank)
+
+            # -----------------------------------------------
+            # Project q_nope via latent key space:
+            #    q_nope       : (B, S, H, nope_dim)
+            #    wkv_b[:, :nope_dim]  maps latent K to NOPE K space
+            # -----------------------------------------------
+            q_nope = torch.einsum(
+                "bshd,hdc->bshc",
+                q_nope,
+                wkv_b[:, :self.qk_nope_head_dim]
+            )
+
+            # Store latent kv and positional K_ROPE in caches
+            self.kv_cache[:bsz, start_pos:end_pos] = self.kv_norm(kv)
+            self.pe_cache[:bsz, start_pos:end_pos] = k_pe.squeeze(2)
+
+            # -----------------------------------------------
+            # Compute attention in latent space:
+            #   scores = q_nope · kv_cacheᵀ + q_pe · pe_cacheᵀ
+            # -----------------------------------------------
+            scores = (
+                torch.einsum("bshc,btc->bsht", q_nope, self.kv_cache[:bsz, :end_pos]) +
+                torch.einsum("bshr,btr->bsht", q_pe, self.pe_cache[:bsz, :end_pos])
+            ) * self.softmax_scale
+
+        # ============================================================================
+        # 5. Apply mask (causal / padding)
+        # ============================================================================
+        if mask is not None:
+            scores = scores + mask.unsqueeze(1)
+
+        # Softmax over "t" dimension (sequence positions)
+        scores = scores.softmax(dim=-1, dtype=torch.float32).type_as(x)
+
+        # ============================================================================
+        # 6. Compute output values (V)
+        # ============================================================================
+        if attn_impl == "naive":
+            # Standard: Weighted sum over full V-cache
+            x = torch.einsum("bsht,bthd->bshd", scores, self.v_cache[:bsz, :end_pos])
+        else:
+            # Latent V = scores * kv_cache
+            x = torch.einsum("bsht,btc->bshc", scores, self.kv_cache[:bsz, :end_pos])
+
+            # Expand latent V → full V via wkv_b
+            x = torch.einsum("bshc,hdc->bshd", x, wkv_b[:, -self.v_head_dim:])
+
+        # Flatten heads and project out
+        x = self.wo(x.flatten(2))
+
+        return x
+

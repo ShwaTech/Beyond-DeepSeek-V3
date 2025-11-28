@@ -478,3 +478,103 @@ class ColumnParallelLinear(Linear):
 
         return y
 
+
+
+class RowParallelLinear(Linear):
+    """
+    Row-parallel linear layer used in tensor model parallelism.
+    Splits the *input features* (rows of the weight matrix) across distributed
+    processes/ranks. Each rank stores a block of the weight matrix along the
+    input dimension and computes a *partial contribution* to the final output.
+
+    Weight layout across ranks:
+        Full weight:   W ∈ R[out_features, in_features]
+        Sharded as:    W_i ∈ R[out_features, in_features / world_size]
+        Where:
+            W = concat([W_0, W_1, ..., W_{N-1}], dim=1)
+
+    Each rank receives its own input slice:
+        x_i ∈ R[..., in_features/world_size]
+
+    And computes its partial output:
+        y_i = x_i @ W_i^T
+
+    Since each rank contributes *part of every output unit*, an all_reduce is
+    required to aggregate partial sums:
+        y = sum_i y_i
+
+    This matches the Megatron-LM row-parallel design, and is used in DeepSeek-V3
+    for attention output projections and MLP second GEMM layers.
+
+    Args:
+        in_features (int):
+            Total number of input features before sharding.
+        out_features (int):
+            Number of output features (replicated across ranks).
+        bias (bool):
+            Whether to include a bias term. Defaults to False.
+        dtype (optional):
+            Weight data type (BF16/FP8/etc.).
+    """
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        bias: bool = False,
+        dtype=None
+    ):
+        # Ensure input features evenly split across tensor-parallel ranks
+        assert (
+            in_features % world_size == 0
+        ), f"Input features must be divisible by world_size={world_size}"
+
+        # Slice of input features handled by THIS rank only
+        self.part_in_features = in_features // world_size
+
+        # Initialize parent Linear with sharded input dimension
+        # (Each rank stores W_i with shape [out_features, part_in_features])
+        super().__init__(self.part_in_features, out_features, bias, dtype)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Compute the row-parallel forward pass.
+
+        Inputs:
+            x should already be sharded across ranks:
+                x_i ∈ R[..., in_features/world_size]
+
+        Local computation:
+            y_i = x_i @ W_i^T   (partial output)
+
+        Distributed aggregation:
+            y = sum_i y_i       (via all_reduce)
+
+        This is necessary because each rank contributes a partial sum to
+        *all* output features.
+
+        Bias is added after the reduction since bias is replicated across ranks.
+
+        Args:
+            x (torch.Tensor):
+                Local input slice for this rank.
+
+        Returns:
+            torch.Tensor:
+                Full output tensor after summing all partial results.
+                Shape: [..., out_features]
+        """
+
+        # Compute local partial output using the global 'linear' implementation
+        # (handles FP8 dequant, BF16 GEMM, or default F.linear)
+        y = linear(x, self.weight)
+
+        # Aggregate partial outputs across all tensor-parallel ranks
+        if world_size > 1:
+            dist.all_reduce(y)
+
+        # Bias is applied after reduction (bias is identical on all ranks)
+        if self.bias is not None:
+            y += self.bias
+
+        return y
+

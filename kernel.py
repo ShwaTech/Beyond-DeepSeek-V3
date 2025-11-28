@@ -422,3 +422,143 @@ fp8_gemm_configs = [
     for block_n in [32, 64, 128]      # Tile width options
     for num_stages in [3, 4, 5, 6]    # Prefetch pipeline depth (latency hiding)
 ]
+
+
+
+# =======================================
+# FP8 GEMM Kernel
+# =======================================
+@triton.autotune(configs=fp8_gemm_configs, key=['N', 'K'])
+@triton.jit
+def fp8_gemm_kernel(a_ptr, b_ptr, c_ptr,
+                    a_s_ptr, b_s_ptr,
+                    M, N: tl.constexpr, K: tl.constexpr,
+                    BLOCK_SIZE_M: tl.constexpr,
+                    BLOCK_SIZE_N: tl.constexpr,
+                    BLOCK_SIZE_K: tl.constexpr):
+    """
+    Performs a matrix multiplication operation on FP8 matrices with scaling factors.
+
+    Args:
+        a_ptr (tl.tensor): Pointer to the first input matrix A.
+        b_ptr (tl.tensor): Pointer to the second input matrix B.
+        c_ptr (tl.tensor): Pointer to the output matrix C.
+        a_s_ptr (tl.tensor): Pointer to the scaling factors for matrix A.
+        b_s_ptr (tl.tensor): Pointer to the scaling factors for matrix B.
+        M (int): Number of rows in matrix A and C.
+        N (tl.constexpr): Number of columns in matrix B and C.
+        K (tl.constexpr): Number of columns in matrix A and rows in matrix B.
+        BLOCK_SIZE_M (tl.constexpr): Block size for the M dimension.
+        BLOCK_SIZE_N (tl.constexpr): Block size for the N dimension.
+        BLOCK_SIZE_K (tl.constexpr): Block size for the K dimension.
+
+    Returns:
+        None
+    """
+    # ------------------------------------------------------------
+    # 1) tile coordinates handled by this program instance
+    # ------------------------------------------------------------
+    pid_m = tl.program_id(axis=0)   # which tile row
+    pid_n = tl.program_id(axis=1)   # which tile column
+
+    # number of K-chunks to iterate (ceil)
+    num_k_chunks = tl.cdiv(K, BLOCK_SIZE_K)
+
+    # ------------------------------------------------------------
+    # 2) compute coordinates (logical indices) for rows/cols in this tile
+    # ------------------------------------------------------------
+    # NOTE: we avoid using modulo (%) for indexing into memory; modulo can *wrap*
+    # and introduce incorrect repeated reads when M or N are not multiples of block size.
+    # Instead, compute the base indices and use masks for bounds checking.
+    row_offsets = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)  # shape: (BLOCK_SIZE_M,)
+    col_offsets = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)  # shape: (BLOCK_SIZE_N,)
+
+    # K offsets in a single chunk (shared across the inner loop)
+    k_offsets = tl.arange(0, BLOCK_SIZE_K)                            # shape: (BLOCK_SIZE_K,)
+
+    # linear offsets to memory for initial K-chunk:
+    # a_base_ptrs shape -> (BLOCK_SIZE_M, BLOCK_SIZE_K)
+    a_ptrs = a_ptr + row_offsets[:, None] * K + k_offsets[None, :]
+    # b_base_ptrs shape -> (BLOCK_SIZE_M? no, we'll compute shape for load below)
+    # for B we want (BLOCK_SIZE_K, BLOCK_SIZE_N) when we load
+    b_ptrs = b_ptr + k_offsets[:, None] * N + col_offsets[None, :]
+
+    # ------------------------------------------------------------
+    # 3) prepare scale indexing (EXPLICIT and SAFE)
+    # ------------------------------------------------------------
+    # We expect a_s_ptr to contain one scale per (row_tile, k_chunk)
+    # and b_s_ptr to contain one scale per (k_chunk, col_tile).
+    #
+    # Layout assumptions (choose the layout you used at quant time):
+    #   a_s layout shape: [num_row_tiles, num_k_chunks]  (index = row_tile * num_k_chunks + k_chunk)
+    #   b_s layout shape: [num_k_chunks, num_col_tiles]  (index = k_chunk * num_col_tiles + col_tile)
+    #
+    # Compute identifiers for this tile:
+    row_tile_id = pid_m                 # 0 .. ceil(M/BM)-1
+    col_tile_id = pid_n                 # 0 .. ceil(N/BN)-1
+    num_col_tiles = tl.cdiv(N, BLOCK_SIZE_N)
+
+    # We'll create pointers for a_s and b_s that we increment inside the loop.
+    # a_s_index_base = row_tile_id * num_k_chunks
+    a_s_ptrs = a_s_ptr + row_tile_id * num_k_chunks
+    # b_s_index_base = col_tile_id (but b_s stored per k_chunk × col_tile)
+    # so b scale index for (k_chunk, col_tile) = k_chunk * num_col_tiles + col_tile_id
+    # We'll step b_s by num_col_tiles each iteration.
+    b_s_ptrs_base = b_s_ptr + col_tile_id
+
+    # ------------------------------------------------------------
+    # 4) accumulator (FP32)
+    # ------------------------------------------------------------
+    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+
+    # ------------------------------------------------------------
+    # 5) K-loop: iterate over each reduction chunk
+    # ------------------------------------------------------------
+    # Each iteration processes BLOCK_SIZE_K elements of the K dimension.
+    for k_idx in range(num_k_chunks):
+        # --- load A tile for this k-chunk:
+        # mask for A load: True where (row_offset < M) and (k_offset + k_idx*BLOCK_SIZE_K < K)
+        a_k_remaining = K - k_idx * BLOCK_SIZE_K
+        a_mask = (row_offsets[:, None] < M) & (k_offsets[None, :] < a_k_remaining)
+
+        # load quantized A block and cast to float32
+        a_q = tl.load(a_ptrs, mask=a_mask, other=0.0).to(tl.float32)   # shape (BM, BK)
+
+        # --- load B tile for this k-chunk:
+        b_k_remaining = K - k_idx * BLOCK_SIZE_K
+        b_mask = (k_offsets[:, None] < b_k_remaining) & (col_offsets[None, :] < N)
+        b_q = tl.load(b_ptrs, mask=b_mask, other=0.0).to(tl.float32)   # shape (BK, BN)
+
+        # --- load scales for this k-chunk:
+        # a_s_ptrs points to [row_tile_id, k_idx] (layout row_tile major)
+        a_s = tl.load(a_s_ptrs + k_idx)   # scalar or vector length 1
+        # b_s_ptrs_base points to [k_idx, col_tile_id] if we step by num_col_tiles
+        b_s = tl.load(b_s_ptrs_base + k_idx * num_col_tiles)   # scalar
+
+        # NOTE: a_s and b_s are scalars for the whole block. If you stored one scale
+        # per row element or per column element inside the block, you'll need to adjust shapes.
+
+        # --- Accumulate:
+        # dot(a_q (BM×BK), b_q (BK×BN)) -> (BM×BN)
+        # then scale by outer product a_s[:, None] * b_s[None, :]
+        # since a_s and b_s are scalars here, this just multiplies the dot by a_s*b_s
+        acc += tl.dot(a_q, b_q) * (a_s * b_s)
+
+        # --- advance pointers to the next K-chunk
+        a_ptrs += BLOCK_SIZE_K                # move the K-window for A
+        b_ptrs += BLOCK_SIZE_K                # move the K-window for B (due to how we built b_ptrs)
+        # a_s_ptrs and b_s_ptrs_base are indexed by k_idx so we don't need to physically increment them
+
+    # ------------------------------------------------------------
+    # 6) write accumulator to C (with bounds mask)
+    # ------------------------------------------------------------
+    # compute the final linear pointers for C tile
+    write_row_offsets = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    write_col_offsets = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    c_ptrs = c_ptr + write_row_offsets[:, None] * N + write_col_offsets[None, :]
+
+    write_mask = (write_row_offsets[:, None] < M) & (write_col_offsets[None, :] < N)
+
+    # cast accumulator to output element type and store with mask
+    c_out = acc.to(c_ptr.dtype.element_ty)
+    tl.store(c_ptrs, c_out, mask=write_mask)

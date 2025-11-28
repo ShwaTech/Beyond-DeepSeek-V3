@@ -216,3 +216,89 @@ def act_quant(
     # 6. Return quantized tensor and scales
     # ----------------------------------------------------------------------
     return y, s
+
+
+
+# =======================================
+# Weight Dequantization Function
+# =======================================
+@triton.jit
+def weight_dequant_kernel(x_ptr, s_ptr, y_ptr, M, N, BLOCK_SIZE: tl.constexpr):
+    """
+    Dequantizes weights using the provided scaling factors and stores the result.
+
+    Args:
+        x_ptr (tl.pointer): Pointer to the quantized weights.
+        s_ptr (tl.pointer): Pointer to the scaling factors.
+        y_ptr (tl.pointer): Pointer to the output buffer for dequantized weights.
+        M (int): Number of rows in the weight matrix.
+        N (int): Number of columns in the weight matrix.
+        BLOCK_SIZE (tl.constexpr): Size of the block for tiling.
+
+    Returns:
+        None
+    """
+    # ----------------------------------------------------------------------
+    # 1. Identify Which Tile This Kernel Instance Should Process
+    # ----------------------------------------------------------------------
+    # Triton launches many "programs" (like CUDA thread blocks).
+    # Each program handles one tile of the matrix.
+    pid_m = tl.program_id(axis=0)    # tile index in the row dimension
+    pid_n = tl.program_id(axis=1)    # tile index in the column dimension
+
+    # ----------------------------------------------------------------------
+    # 2. Number of Column Tiles (for locating scale index)
+    # ----------------------------------------------------------------------
+    # N may not divide BLOCK_SIZE exactly. cdiv = ceil(N / BLOCK_SIZE).
+    n_col_blocks = tl.cdiv(N, BLOCK_SIZE)
+
+    # ----------------------------------------------------------------------
+    # 3. Compute Row and Column Offsets for This Tile
+    # ----------------------------------------------------------------------
+    # offs_m = [row0, row1, row2, ..., row(BLOCK_SIZE-1)]
+    offs_m = pid_m * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+
+    # offs_n = [col0, col1, col2, ..., col(BLOCK_SIZE-1)]
+    offs_n = pid_n * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+
+    # Produce a full (BLOCK_SIZE × BLOCK_SIZE) grid of linear indices:
+    # linear_index = row * N + col
+    # Broadcasting:
+    #   offs_m[:, None] shape = (BLOCK_SIZE, 1)
+    #   offs_n[None, :] shape = (1, BLOCK_SIZE)
+    offs = offs_m[:, None] * N + offs_n[None, :]
+
+    # ----------------------------------------------------------------------
+    # 4. Mask for Out-of-Bounds (Edges of Matrix)
+    # ----------------------------------------------------------------------
+    # Ensures loads and stores only occur where indices are valid.
+    mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+
+    # ----------------------------------------------------------------------
+    # 5. Load Quantized Weights for This Tile
+    # ----------------------------------------------------------------------
+    # Read BLOCK_SIZE×BLOCK_SIZE values from x_ptr.
+    # Unsafe locations masked → zero-filled instead of crashing.
+    x_q = tl.load(x_ptr + offs, mask=mask)
+
+    # Convert quantized values (float8/int8) → float32 for math.
+    x_fp32 = x_q.to(tl.float32)
+
+    # ----------------------------------------------------------------------
+    # 6. Load Scale Factor for This Tile
+    # ----------------------------------------------------------------------
+    # One scale per tile:
+    #   block_index = pid_m * n_col_blocks + pid_n
+    s = tl.load(s_ptr + pid_m * n_col_blocks + pid_n)
+
+    # ----------------------------------------------------------------------
+    # 7. Perform Dequantization
+    # ----------------------------------------------------------------------
+    # W_fp32 = W_quantized * scale
+    y = x_fp32 * s
+
+    # ----------------------------------------------------------------------
+    # 8. Store Result into Output Buffer
+    # ----------------------------------------------------------------------
+    # Mask ensures we only write valid positions.
+    tl.store(y_ptr + offs, y, mask=mask)

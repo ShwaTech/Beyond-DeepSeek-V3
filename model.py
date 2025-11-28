@@ -1457,3 +1457,85 @@ class Gate(nn.Module):
         # Return both weights and expert indices
         return weights.type_as(x), indices
 
+
+
+class Expert(nn.Module):
+    """
+    Expert layer used in Mixture-of-Experts (MoE) models.
+
+    Each expert is an independent feed-forward network (MLP) that processes
+    a subset of tokens routed to it by the gating mechanism. The Expert
+    encapsulates a **gated MLP transformation**, including nonlinear
+    activations and feature mixing.
+
+    Attributes:
+        w1 (nn.Module): Input-to-hidden linear layer (dim → inter_dim).
+        w2 (nn.Module): Hidden-to-output linear layer (inter_dim → dim).
+        w3 (nn.Module): Additional linear layer (dim → inter_dim) used for gating.
+    """
+
+    def __init__(self, dim: int, inter_dim: int):
+        """
+        Initializes the Expert layer.
+
+        Args:
+            dim (int): Input and output dimensionality. Each token is a vector of size `dim`.
+            inter_dim (int): Hidden layer dimensionality (intermediate MLP width).
+
+        Intuition:
+            • Experts are specialized feed-forward networks that capture token-specific patterns.
+            • inter_dim is typically larger than dim to increase model capacity and allow non-linear transformations.
+        """
+        super().__init__()
+
+        # ------------------------------------------------------------------
+        # Linear layer for input → hidden projection
+        # Shape: (B, dim) → (B, inter_dim)
+        # Typically followed by a non-linear activation (SiLU)
+        # ------------------------------------------------------------------
+        self.w1 = Linear(dim, inter_dim)
+
+        # ------------------------------------------------------------------
+        # Linear layer for hidden → output projection
+        # Shape: (B, inter_dim) → (B, dim)
+        # Converts the expanded hidden representation back to model dimension
+        # ------------------------------------------------------------------
+        self.w2 = Linear(inter_dim, dim)
+
+        # ------------------------------------------------------------------
+        # Additional linear layer for gating/multiplicative interaction
+        # Shape: (B, dim) → (B, inter_dim)
+        # This is used to modulate the hidden representation (FiLM-like)
+        # Multiplies with SiLU-activated hidden features from w1
+        # ------------------------------------------------------------------
+        self.w3 = Linear(dim, inter_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass for the Expert.
+
+        Args:
+            x (torch.Tensor): Input tensor with shape (B, dim), where B = batch size (tokens routed to this expert).
+
+        Returns:
+            torch.Tensor: Output tensor with shape (B, dim) after expert MLP transformation.
+
+        Computation:
+            1. Project input → hidden: h = w1(x)
+            2. Apply non-linearity (SiLU/GELU): h_nl = SiLU(h)
+            3. Modulate with w3(x): h_mod = h_nl * w3(x)
+                - This allows multiplicative interactions and gating.
+                - Often referred to as a "gated MLP" or "GLU-like" block.
+            4. Project back to model dimension: y = w2(h_mod)
+        """
+
+        # Step 1 + 2 + 3: Gated MLP computation
+        # h1 = SiLU(w1(x))                --> (B, inter_dim)
+        # h3 = w3(x)                      --> (B, inter_dim)
+        # Element-wise multiply: h1 * h3  --> (B, inter_dim)
+        gated_hidden = F.silu(self.w1(x)) * self.w3(x)
+
+        # Step 4: Project back to model dimension
+        # y = w2(gated_hidden)            --> (B, dim)
+        return self.w2(gated_hidden)
+

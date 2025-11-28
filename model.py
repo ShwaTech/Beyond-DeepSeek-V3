@@ -578,3 +578,80 @@ class RowParallelLinear(Linear):
 
         return y
 
+
+
+class RMSNorm(nn.Module):
+    """
+    Root Mean Square Layer Normalization (RMSNorm).
+
+    RMSNorm is a simplified normalization method used in modern large-scale
+    architectures (DeepSeek-V3, Llama, Falcon) because it is:
+        - Computationally cheaper than LayerNorm
+        - More numerically stable at very large hidden sizes
+        - Better suited for FP8 and BF16 mixed-precision compute
+        - Friendlier to distributed execution pipelines
+
+    Unlike LayerNorm, RMSNorm does *not* subtract the mean of activations.
+    Instead, it normalizes only by the root-mean-square (RMS):
+
+        y = x * weight / sqrt(mean(x^2) + eps)
+
+    This removes the need for both:
+        - Mean-centering (x - mean)
+        - A learned bias parameter
+
+    Making it significantly simpler and faster, especially in highly parallel
+    environments like DeepSeek-V3.
+
+    Args:
+        dim (int):
+            The last-dimension size of the input tensor. RMSNorm normalizes
+            across this dimension.
+
+        eps (float):
+            Small epsilon added to the denominator for numerical stability.
+            Prevents division-by-zero in FP8/BF16 execution.
+    """
+
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+
+        # Store configuration
+        self.dim = dim
+        self.eps = eps
+
+        # RMSNorm has only one learned parameter: scale (γ)
+        # This is applied elementwise after normalization.
+        #
+        # No bias term is used because RMSNorm does not shift activations.
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Apply RMSNorm to the input.
+
+        PyTorch provides F.rms_norm() that directly implements:
+            norm = x / sqrt(mean(x^2, dim=-1, keepdim=True) + eps)
+            y = norm * weight
+
+        Input:
+            x : Tensor[..., dim]
+                Arbitrary leading dimensions, normalization applies to last dim.
+
+        Returns:
+            Tensor[..., dim]
+                RMS-normalized output, scaled by learned weight.
+        """
+
+        # Delegate to the optimized PyTorch fused implementation.
+        # This is important for DeepSeek-V3 because:
+        #   - It uses vectorized RMS computation
+        #   - Runs efficiently under FP8/BF16 precision
+        #   - Works well with fused kernels and CUDA graph capture
+        return F.rms_norm(
+            x,
+            (self.dim,),   # Normalize across this dimension
+            self.weight,   # Learned scale parameter γ
+            self.eps       # Numerical stability
+        )
+

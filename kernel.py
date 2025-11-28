@@ -220,7 +220,7 @@ def act_quant(
 
 
 # =======================================
-# Weight Dequantization Function
+# Weight Dequantization Kernel
 # =======================================
 @triton.jit
 def weight_dequant_kernel(x_ptr, s_ptr, y_ptr, M, N, BLOCK_SIZE: tl.constexpr):
@@ -302,3 +302,82 @@ def weight_dequant_kernel(x_ptr, s_ptr, y_ptr, M, N, BLOCK_SIZE: tl.constexpr):
     # ----------------------------------------------------------------------
     # Mask ensures we only write valid positions.
     tl.store(y_ptr + offs, y, mask=mask)
+
+
+# =======================================
+# Weight Dequantization Function
+# =======================================
+def weight_dequant(x: torch.Tensor, s: torch.Tensor, block_size: int = 128) -> torch.Tensor:
+    """
+    Dequantizes the given weight tensor using the provided scale tensor.
+
+    Args:
+        x (torch.Tensor): The quantized weight tensor of shape (M, N).
+        s (torch.Tensor): The scale tensor of shape (M//block_size, N//block_size).
+        block_size (int, optional): The block size to use for dequantization. Defaults to 128.
+
+    Returns:
+        torch.Tensor: The dequantized weight tensor of the same shape as `x`.
+
+    Raises:
+        AssertionError: If `x` or `s` are not contiguous or if their dimensions are not 2.
+    """
+    # ----------------------------------------------------------------------
+    # 1. Validate Tensor Layout (Important for Triton Memory Access)
+    # ----------------------------------------------------------------------
+    assert x.is_contiguous() and s.is_contiguous(), \
+        "Input tensors must be contiguous for efficient GPU loads/stores."
+
+    # Ensure both inputs are rank-2 matrices
+    assert x.dim() == 2 and s.dim() == 2, \
+        "x and s must be 2D matrices (M×N and M/block × N/block)."
+
+    # ----------------------------------------------------------------------
+    # 2. Extract Matrix Shape
+    # ----------------------------------------------------------------------
+    M, N = x.size()      # M rows, N columns
+
+    # ----------------------------------------------------------------------
+    # 3. Allocate Output Matrix for Dequantized FP32 Weights
+    # ----------------------------------------------------------------------
+    # dtype=torch.get_default_dtype() ensures FP32 or BF16 depending on PyTorch config
+    y = torch.empty_like(x, dtype=torch.get_default_dtype())
+
+    # ----------------------------------------------------------------------
+    # 4. Define Triton Kernel Launch Grid
+    # ----------------------------------------------------------------------
+    # Triton launches a 2D grid:
+    #   grid = (#row_tiles, #column_tiles)
+    #
+    # Each tile = block_size × block_size region of the weight matrix.
+    #
+    grid = lambda meta: (
+        triton.cdiv(M, meta['BLOCK_SIZE']),  # number of row tiles
+        triton.cdiv(N, meta['BLOCK_SIZE']),  # number of column tiles
+    )
+
+    # ----------------------------------------------------------------------
+    # 5. Launch The Dequantization Kernel
+    # ----------------------------------------------------------------------
+    # This calls the compiled Triton kernel:
+    #
+    #   weight_dequant_kernel(x, s, y, M, N, BLOCK_SIZE=block_size)
+    #
+    # The kernel:
+    #   - loads a tile of quantized weights
+    #   - loads the proper blockwise scale
+    #   - multiplies (in FP32)
+    #   - writes into y
+    #
+    weight_dequant_kernel[grid](
+        x,      # pointer to quantized matrix
+        s,      # pointer to scale matrix
+        y,      # output FP32 buffer
+        M, N,   # matrix dimensions
+        BLOCK_SIZE=block_size
+    )
+
+    # ----------------------------------------------------------------------
+    # 6. Return Full Dequantized Matrix
+    # ----------------------------------------------------------------------
+    return y

@@ -1284,3 +1284,176 @@ class MLP(nn.Module):
         # Final projection W2(hidden)
         # RowParallelLinear performs necessary all-reduce if multiple GPUs
         return self.w2(hidden)
+
+
+
+class Gate(nn.Module):
+    """
+    Gating mechanism used in Mixture-of-Experts (MoE) models.
+
+    The gate selects which experts should process each input token, and with
+    what weight. This module implements:
+        • Dense score computation (W·x)
+        • Optional bias addition
+        • Optional grouping of experts (for hierarchical MoE)
+        • Top-K routing
+        • Softmax/Sigmoid-based gate scoring
+        • Optional normalization of routing weights
+        • Scaling (route_scale)
+
+    This is a *routing network*, not a normal neural layer. It decides:
+        "Which experts should this token go to?"
+    """
+
+    def __init__(self, args: ModelArgs):
+        """
+        Initializes the gating module.
+
+        Args:
+            args (ModelArgs):
+                A configuration object containing the following fields:
+
+                • dim: Hidden dimension of token embeddings
+                • n_routed_experts: Total number of experts available
+                • n_activated_experts: Number of experts to activate per token (top-K)
+                • n_expert_groups: Number of expert groups used for hierarchical routing
+                • n_limited_groups: Groups chosen before selecting experts
+                • score_func: 'softmax' or 'sigmoid' for score activation
+                • route_scale: Scaling factor applied to final routing weights
+        """
+        super().__init__()
+
+        # Embedding dimension of each token
+        self.dim = args.dim
+
+        # Number of experts selected per token (top-K routing)
+        self.topk = args.n_activated_experts
+
+        # Grouping parameters (used in multi-group MoE variants)
+        self.n_groups = args.n_expert_groups
+        self.topk_groups = args.n_limited_groups
+
+        # How to convert raw scores → routing weights
+        self.score_func = args.score_func
+
+        # Optional scaling factor after normalization
+        self.route_scale = args.route_scale
+
+        # ----------------------------------------------------------------------
+        # Learnable parameters
+        # ----------------------------------------------------------------------
+        # Shape: (n_routed_experts, dim)
+        # Each expert has its own score vector.
+        # Score = W_e · x is the "expert relevance" for token x.
+        self.weight = nn.Parameter(torch.empty(args.n_routed_experts, args.dim))
+
+        # Llama uses bias only when dim == 7168 (architecture-specific detail)
+        self.bias = (
+            nn.Parameter(torch.empty(args.n_routed_experts, dtype=torch.float32))
+            if self.dim == 7168 else None
+        )
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Performs routing for the given tokens.
+
+        Args:
+            x (torch.Tensor):
+                Input tensor of shape (B, dim) or (T, dim), where each row is a token.
+
+        Returns:
+            Tuple[Tensor, Tensor]:
+                weights:  (B, topk) final normalized routing weights
+                indices:  (B, topk) expert indices selected for each token
+        """
+
+        # ------------------------------------------------------------------
+        # 1. Compute Raw Scores: W · x
+        # ------------------------------------------------------------------
+        # linear(x, W) performs x @ W^T
+        # Output shape: (B, n_routed_experts)
+        scores = linear(x, self.weight)
+
+        # ------------------------------------------------------------------
+        # 2. Convert raw scores → probability-like values
+        # ------------------------------------------------------------------
+        if self.score_func == "softmax":
+            # Softmax produces a probability distribution across experts
+            scores = scores.softmax(dim=-1, dtype=torch.float32)
+        else:
+            # Sigmoid produces independent activations per expert
+            # (Not normalized — will be normalized later)
+            scores = scores.sigmoid()
+
+        # Save pre-bias scores so we can later gather weights
+        original_scores = scores
+
+        # ------------------------------------------------------------------
+        # 3. Add bias if present (LLAMA-style)
+        # ------------------------------------------------------------------
+        if self.bias is not None:
+            scores = scores + self.bias
+
+        # ------------------------------------------------------------------
+        # 4. Multi-Group Routing (Hierarchical MoE)
+        # ------------------------------------------------------------------
+        # Before selecting individual experts, we optionally restrict routing
+        # to only a subset of groups.
+        # Example:
+        #   Experts = 64, Groups = 8 → 8 groups of 8 experts
+        #
+        #   Step 1: Select the top `topk_groups`
+        #   Step 2: Select experts only *within* those groups
+        # ------------------------------------------------------------------
+        if self.n_groups > 1:
+
+            # Reshape to: (B, n_groups, experts_per_group)
+            scores = scores.view(x.size(0), self.n_groups, -1)
+
+            if self.bias is None:
+                # If no bias, use max score in each group as group-level score
+                # Shape: (B, n_groups)
+                group_scores = scores.amax(dim=-1)
+            else:
+                # If bias exists, heuristically approximate group strength using
+                # sum of top-2 expert scores in each group.
+                group_scores = scores.topk(2, dim=-1)[0].sum(dim=-1)
+
+            # Select the top-k groups
+            # indices shape: (B, topk_groups)
+            indices = group_scores.topk(self.topk_groups, dim=-1)[1]
+
+            # Mask groups NOT selected
+            mask = scores.new_ones(x.size(0), self.n_groups, dtype=bool)
+            mask = mask.scatter_(1, indices, False)
+
+            # Fill out-of-group scores with −∞ so they can never be chosen
+            scores = scores.masked_fill_(mask.unsqueeze(-1), float("-inf"))
+
+            # Flatten back to (B, n_routed_experts)
+            scores = scores.flatten(1)
+
+        # ------------------------------------------------------------------
+        # 5. Select Top-K Experts After Group Filtering
+        # ------------------------------------------------------------------
+        # indices: (B, topk)
+        indices = torch.topk(scores, self.topk, dim=-1)[1]
+
+        # Gather the *original* (softmax/sigmoid) values for weights
+        weights = original_scores.gather(1, indices)
+
+        # ------------------------------------------------------------------
+        # 6. Normalize weights if using sigmoid activation
+        # ------------------------------------------------------------------
+        if self.score_func == "sigmoid":
+            # Convert independent sigmoid activations → normalized mixture
+            weights /= weights.sum(dim=-1, keepdim=True)
+
+        # ------------------------------------------------------------------
+        # 7. Apply global scaling factor
+        # ------------------------------------------------------------------
+        weights *= self.route_scale
+
+        # Return both weights and expert indices
+        return weights.type_as(x), indices
+

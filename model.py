@@ -400,3 +400,82 @@ class Linear(nn.Module):
         """
         return linear(x, self.weight, self.bias, self.scale_fmt)
 
+
+
+class ColumnParallelLinear(Linear):
+    """
+    Column-parallel linear layer used in tensor model parallelism.
+    Splits the *output features* across distributed processes (ranks), so each
+    rank holds a slice of the full weight matrix along the output dimension.
+
+    This layer implements:
+        W = [W_0, W_1, ..., W_{world_size-1}]  (split by columns)
+
+    Meaning each rank stores:
+        W_i ∈ R[out_features/world_size, in_features]
+
+    And computes its partial output:
+        y_i = x @ W_i^T + b_i
+
+    These partial results can either:
+        - be returned directly (for intermediate transformer blocks), or
+        - be reduced/concatenated later depending on model architecture.
+
+    Args:
+        in_features (int):
+            Number of input features.
+        out_features (int):
+            Total number of output features before splitting.
+        bias (bool):
+            Whether to include a bias term. Defaults to False.
+        dtype (optional):
+            Data type for storing weights (FP8/BF16/etc.).
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        bias: bool = False,
+        dtype=None
+    ):
+        # Ensure output features are evenly divisible across tensor-parallel ranks
+        assert (
+            out_features % world_size == 0
+        ), f"Output features must be divisible by world_size={world_size}"
+
+        # Number of output units handled by THIS rank only
+        self.part_out_features = out_features // world_size
+
+        # Initialize parent Linear module with the sliced output dimension
+        super().__init__(in_features, self.part_out_features, bias, dtype)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Compute the column-parallel forward pass.
+
+        Each rank performs:
+            y_i = x @ W_i^T + b_i
+
+        - No all_reduce is performed here.
+        - The caller is responsible for gathering results if full output is needed.
+        - This matches Megatron-LM style tensor parallelism, also adopted by DeepSeek-V3.
+
+        Args:
+            x (torch.Tensor):
+                Input tensor of shape [..., in_features].
+
+        Returns:
+            torch.Tensor:
+                Partial output tensor of shape [..., out_features/world_size].
+                (Each rank returns its local column-slice of the output.)
+        """
+
+        # Uses the global 'linear' function, which dispatches to:
+        # - FP32/BF16 F.linear for normal weights
+        # - FP8 optimized GEMM path for quantized weights
+        # - Block-wise scaling logic when needed (FP8 acts)
+        y = linear(x, self.weight, self.bias)
+
+        return y
+

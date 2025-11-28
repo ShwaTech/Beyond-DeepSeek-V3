@@ -316,3 +316,87 @@ def linear(
 
         return y
 
+
+
+class Linear(nn.Module):
+    """
+    Custom linear layer supporting FP8-quantized weights, optional bias,
+    and automatic dispatch to the appropriate GEMM implementation.
+
+    Args:
+        in_features (int):
+            Number of input features.
+        out_features (int):
+            Number of output features.
+        bias (bool, optional):
+            Whether to include a learnable bias. Defaults to False.
+        dtype (optional):
+            Data type for storing weights (e.g., torch.bfloat16 or FP8).
+            If None, defaults to `Linear.dtype`.
+
+    Notes:
+        - If `dtype` results in 1-byte storage (FP8), a block-wise scale tensor
+            is created and stored as `weight.scale`.
+        - For non-quantized types (BF16/FP16/FP32), no scale parameter is created.
+        - The forward pass delegates computation to the `linear()` function,
+            which chooses FP32, BF16, or FP8 GEMM depending on tensor formats.
+    """
+
+    # Default datatype for the layer unless explicitly overridden
+    dtype = torch.bfloat16
+
+    # Optional activation scaling format for FP8 quantization
+    scale_fmt: Optional[str] = None
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        bias: bool = False,
+        dtype=None
+    ):
+        super().__init__()
+
+        self.in_features = in_features
+        self.out_features = out_features
+
+        # Initialize weight (may be FP8 or BF16/FP16/FP32)
+        self.weight = nn.Parameter(
+            torch.empty(out_features, in_features, dtype=dtype or Linear.dtype)
+        )
+
+        # If weight is quantized (element_size() == 1 → FP8)
+        if self.weight.element_size() == 1:
+            scale_out = (out_features + block_size - 1) // block_size
+            scale_in = (in_features + block_size - 1) // block_size
+
+            # Block-wise scale for FP8 weight matrix
+            self.weight.scale = self.scale = nn.Parameter(
+                torch.empty(scale_out, scale_in, dtype=torch.float32)
+            )
+        else:
+            # No scale needed for non-quantized weights
+            self.register_parameter("scale", None)
+
+        # Optional bias
+        if bias:
+            self.bias = nn.Parameter(torch.empty(out_features))
+        else:
+            self.register_parameter("bias", None)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Apply the linear transformation y = xW^T + b,
+        using FP8, BF16, or standard FP32 computations
+        depending on the layer’s weight format.
+
+        Args:
+            x (torch.Tensor):
+                Input activation tensor.
+
+        Returns:
+            torch.Tensor:
+                Output tensor after linear transformation.
+        """
+        return linear(x, self.weight, self.bias, self.scale_fmt)
+

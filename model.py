@@ -1169,3 +1169,118 @@ class MLA(nn.Module):
 
         return x
 
+
+
+class MLP(nn.Module):
+    """
+    Multi-Layer Perceptron (MLP) block used in DeepSeek-V3 as the feed-forward
+    part of the transformer layer.
+
+    This MLP implementation is *not a standard FFN*.  
+    It uses:
+        - ColumnParallelLinear / RowParallelLinear (tensor parallelism support)
+        - A gated activation mechanism:
+              silu(W1(x)) * W3(x)
+        which is similar to:
+            Gated Linear Units (GLU) / SwiGLU
+        - High-throughput distributed linear layers for scalability.
+
+    The structure matches the FFN used in modern high-performance LLMs
+    (LLaMA, Mixtral, DeepSeek-V3).
+    """
+
+    def __init__(self, dim: int, inter_dim: int):
+        """
+        Initializes the MLP layer.
+
+        Args:
+            dim (int): Input hidden dimension of the transformer. Also the output dimension (residual path).
+            inter_dim (int): Expanded intermediate dimension. Usually 3–4× dim in large LLMs.
+
+        Architecture:
+                      ┌─────────────┐
+                      │     W1      │  --> "gate branch"
+                      └─────────────┘
+                            │
+                           SiLU
+                            │
+         x ──► W1 ──► SiLU ──┐
+                             │  elementwise multiply
+                             ├───► W2 ──► output
+         x ──► W3 ───────────┘
+
+        Parallelism:
+            * W1, W3 are ColumnParallelLinear
+                → split output features among GPUs.
+
+            * W2 is RowParallelLinear
+                → split input features among GPUs.
+
+        This gives:
+            - Faster training on multi-GPU systems
+            - Reduced memory per device
+            - Automatic all-reduce synchronization
+        """
+        super().__init__()
+
+        # First projection (expands dimensionality)
+        # ColumnParallelLinear splits OUT features across GPUs.
+        self.w1 = ColumnParallelLinear(dim, inter_dim)
+
+        # Second projection (projects back down to hidden dimension)
+        # RowParallelLinear splits IN features across GPUs.
+        self.w2 = RowParallelLinear(inter_dim, dim)
+
+        # Third projection (second branch of the gated feed-forward)
+        # Also ColumnParallelLinear since output is "inter_dim".
+        self.w3 = ColumnParallelLinear(dim, inter_dim)
+
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass for the DeepSeek MLP.
+
+        Args:
+            x (torch.Tensor): Tensor of shape (batch, seq_len, dim)
+
+        Returns:
+            torch.Tensor: Output tensor of shape (batch, seq_len, dim)
+
+        Computation:
+
+            Let:
+                a = W1(x)
+                b = W3(x)
+
+            Then the gated activation is:
+                h = silu(a) * b
+
+            Then apply the final projection:
+                y = W2(h)
+
+            This design is similar to:
+                SwiGLU = silu(W1(x)) * W3(x)
+
+            Benefits:
+                • Provides better gradient flow than ReLU
+                • Allows multiplicative interactions
+                • Increases expressiveness without additional depth
+                • Reduces training instability
+
+        Distributed behavior:
+            • W1 and W3 output slices are placed on each GPU
+            • elementwise multiplication happens locally
+            • W2 merges (all-reduce) contributions across GPUs
+        """
+        # Compute W1(x) → gate branch, followed by SiLU activation
+        gate = F.silu(self.w1(x))
+
+        # Compute W3(x) → value branch
+        value = self.w3(x)
+
+        # Elementwise gated activation (SwiGLU-style)
+        hidden = gate * value
+
+        # Final projection W2(hidden)
+        # RowParallelLinear performs necessary all-reduce if multiple GPUs
+        return self.w2(hidden)

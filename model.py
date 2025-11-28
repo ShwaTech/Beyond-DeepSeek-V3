@@ -821,3 +821,74 @@ def precompute_freqs_cis(args: ModelArgs) -> torch.Tensor:
     freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
 
     return freqs_cis
+
+
+
+def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
+    """
+    Applies rotary positional embeddings (RoPE) to the input tensor using complex-number
+    rotation. RoPE injects position-dependent rotation into the hidden representations,
+    enabling attention to encode relative positions.
+
+    This implementation:
+        • Converts the last dimension of `x` into complex pairs.  
+        • Multiplies each complex pair by the corresponding complex exponential from
+            `freqs_cis`, performing the rotary transformation.  
+        • Converts the rotated complex pairs back to real-valued tensor format.  
+
+    Args:
+        x (torch.Tensor):
+            The input tensor to which rotary embeddings will be applied.
+            Expected shape:
+                (batch_size, seq_len, num_heads, head_dim)
+            where `head_dim` must be even because RoPE operates on (real, imaginary) pairs.
+        
+        freqs_cis (torch.Tensor):
+            Precomputed complex exponential values encoding positional frequencies.
+            Expected shape:
+                (seq_len, head_dim // 2)
+            Will be automatically broadcast to match the batch and head dimensions.
+
+    Returns:
+        torch.Tensor:
+            The tensor after applying rotary positional embeddings.
+            Shape is identical to the input `x`.
+
+    Notes:
+        • The function internally casts `x` to float to perform complex math, then
+          restores it to its original dtype.
+        • RoPE relies on interpreting each consecutive pair of features as a complex
+          number (real, imaginary). Complex multiplication with `freqs_cis` performs
+          the rotational transformation.
+    """
+
+    # Save original dtype (e.g., bf16, fp16)
+    dtype = x.dtype
+
+    # ---------------------------------------------------------------
+    # Convert last dimension (head_dim) into complex numbers:
+    #   (real_part, imag_part) → complex tensor
+    # Shape: (B, T, H, head_dim/2)
+    # ---------------------------------------------------------------
+    x = torch.view_as_complex(
+        x.float().view(*x.shape[:-1], -1, 2)
+    )
+
+    # ---------------------------------------------------------------
+    # Prepare freqs_cis for broadcasting:
+    # Input freqs_cis: (T, head_dim/2)
+    # Reshaped to: (1, T, 1, head_dim/2)
+    # Broadcasted over: batch_size × num_heads
+    # ---------------------------------------------------------------
+    freqs_cis = freqs_cis.view(1, x.size(1), 1, x.size(-1))
+
+    # ---------------------------------------------------------------
+    # Apply rotation:
+    #   complex_out = x * freqs_cis
+    # Then convert back to real tensor:
+    #   complex → (real, imag) → flatten → original head_dim
+    # ---------------------------------------------------------------
+    y = torch.view_as_real(x * freqs_cis).flatten(3)
+
+    # Restore original dtype and return
+    return y.to(dtype)

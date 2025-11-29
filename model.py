@@ -1539,3 +1539,170 @@ class Expert(nn.Module):
         # y = w2(gated_hidden)            --> (B, dim)
         return self.w2(gated_hidden)
 
+
+
+class MoE(nn.Module):
+    """
+    Mixture-of-Experts (MoE) Layer for DeepSeek-V3 / Large Language Models.
+
+    The MoE layer is a **sparse feed-forward block** that routes each token
+    to a subset of the most relevant experts using softmax/sigmoid for efficient computation,
+    increasing model capacity without a linear increase in FLOPs.
+
+    Intuition:
+        • MoE allows for parallel processing of tokens, enabling efficient scaling.
+        • Routing tokens to relevant experts reduces redundant computations.
+        • Shared MLPs across tokens enable efficient parameter sharing.
+
+    ========================================================================
+    Input x (B, seq_len, dim)
+            │
+            ▼
+        Flatten to (num_tokens, dim)
+            │
+            ├──► Gate ─► weights & indices (num_tokens, top-K)
+            │
+            └──► Sparse Expert Routing
+                    ├── Expert 0: x[routed_tokens] -> y0
+                    ├── Expert 1: x[routed_tokens] -> y1
+                    ├── Expert 2: x[routed_tokens] -> y2
+                    └── ...
+            │
+            ▼
+        Sum weighted expert outputs (y)
+            │
+            ├──► Shared MLP (all tokens) -> z
+            │
+            ▼
+        Combine: y + z
+            │
+            ▼
+    Reshape to original input shape
+    ========================================================================
+
+    Attributes:
+        dim (int): Dimensionality of input features (model hidden size).
+        n_routed_experts (int): Total number of experts across all devices.
+        n_local_experts (int): Number of experts handled by the current device (rank).
+        n_activated_experts (int): Number of experts each token is routed to (top-K).
+        gate (nn.Module): Gating network responsible for routing tokens to experts.
+        experts (nn.ModuleList): Local expert modules (Expert instances).
+        shared_experts (nn.Module): Dense shared MLP applied to all tokens (optional).
+    """
+
+    def __init__(self, args: ModelArgs):
+        """
+        Initializes the Mixture-of-Experts (MoE) module.
+
+        Args:
+            args (ModelArgs): Contains MoE hyperparameters such as:
+                - n_routed_experts: total experts
+                - n_activated_experts: top-K activated experts per token
+                - moe_inter_dim: hidden dimension of each expert
+                - dim: input/output dimension
+        """
+        super().__init__()
+
+        self.dim = args.dim
+
+        # Ensure global expert count is divisible by world_size for distributed parallelism
+        assert args.n_routed_experts % world_size == 0, \
+            f"Number of experts must be divisible by world size (world_size={world_size})"
+
+        # -------------------------------
+        # Compute local expert indices
+        # -------------------------------
+        self.n_routed_experts = args.n_routed_experts       # total experts
+        self.n_local_experts = args.n_routed_experts // world_size  # experts on this device
+        self.n_activated_experts = args.n_activated_experts # top-K routing per token
+        self.experts_start_idx = rank * self.n_local_experts
+        self.experts_end_idx = self.experts_start_idx + self.n_local_experts
+
+        # -------------------------------
+        # Initialize the gating network
+        # -------------------------------
+        # The gate computes routing weights and top-K expert indices
+        self.gate = Gate(args)
+
+        # -------------------------------
+        # Initialize expert modules
+        # -------------------------------
+        # Only local experts are instantiated on this device; remote experts are None
+        # Each expert is a small feed-forward network (Expert class)
+        self.experts = nn.ModuleList([
+            Expert(args.dim, args.moe_inter_dim) if self.experts_start_idx <= i < self.experts_end_idx else None
+            for i in range(self.n_routed_experts)
+        ])
+
+        # -------------------------------
+        # Shared experts
+        # -------------------------------
+        # Dense MLP applied to all tokens, not routed. Can be used for global context.
+        # Acts as a baseline/shortcut path to ensure all tokens get processed
+        self.shared_experts = MLP(args.dim, args.n_shared_experts * args.moe_inter_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass for MoE.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (B, ..., dim) where B is batch size and dim is hidden size.
+
+        Returns:
+            torch.Tensor: Output tensor of the same shape as input, after expert routing.
+        """
+
+        # -------------------------------
+        # Flatten input to (num_tokens, dim)
+        # -------------------------------
+        # Ensures each token is treated individually for routing
+        shape = x.size()
+        x = x.view(-1, self.dim)   # (num_tokens, dim)
+
+        # -------------------------------
+        # Compute routing via Gate
+        # -------------------------------
+        # weights: (num_tokens, top-K)  -> routing probabilities
+        # indices: (num_tokens, top-K)  -> selected expert indices for each token
+        weights, indices = self.gate(x)
+
+        # Initialize output tensor
+        y = torch.zeros_like(x)  # (num_tokens, dim)
+
+        # Compute token counts for each expert (used for sparse expert processing)
+        counts = torch.bincount(indices.flatten(), minlength=self.n_routed_experts).tolist()
+
+        # -------------------------------
+        # Sparse expert computation
+        # -------------------------------
+        # Iterate only over local experts (experts that exist on this device)
+        for i in range(self.experts_start_idx, self.experts_end_idx):
+            if counts[i] == 0:  # Skip experts with no routed tokens
+                continue
+
+            expert = self.experts[i]
+
+            # Find token indices that are routed to expert i
+            idx, top = torch.where(indices == i)  # idx = token indices, top = position in top-K
+
+            # Forward pass through expert and weight output by routing probability
+            y[idx] += expert(x[idx]) * weights[idx, top, None]
+
+        # -------------------------------
+        # Shared expert computation
+        # -------------------------------
+        # Apply dense MLP to all tokens (optional baseline pathway)
+        z = self.shared_experts(x)  # (num_tokens, dim)
+
+        # -------------------------------
+        # Distributed aggregation
+        # -------------------------------
+        # Sum outputs across all devices
+        if world_size > 1:
+            dist.all_reduce(y)
+
+        # -------------------------------
+        # Combine sparse expert outputs with shared expert outputs
+        # -------------------------------
+        return (y + z).view(shape)  # restore original input shape
+

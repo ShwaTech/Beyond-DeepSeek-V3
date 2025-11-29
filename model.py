@@ -1723,6 +1723,26 @@ class Block(nn.Module):
     This follows the modern “*Pre-Norm* + Residual” architecture
     used in LLaMA, Mistral, GPT-NeoX, DeepSeek-V2, etc.
 
+    🔥 High-Level Summary of What This Block Does
+
+        Each block performs two major transformations:
+
+            x → Attention → Add to input → FeedForward/MoE → Add again → output
+
+        More specifically:
+
+            1. Attention Path
+                • Normalizes the input (RMSNorm)
+                • Applies MLA attention
+                • Adds back to the input (residual)
+
+            2. Feed-Forward / MoE Path
+                • Normalizes the result
+                • Applies either:
+                    • Dense MLP (early layers)
+                    • MoE (deep layers)
+                • Adds back to the input (residual)
+
     Attributes:
         attn (nn.Module):
             Multi-Head Latent Attention (MLA).

@@ -480,3 +480,30 @@ def main(
     if world_size > 1:
         dist.destroy_process_group()
 
+
+
+if __name__ == "__main__":
+    """
+    Command-line interface for distributed text generation.
+
+    Arguments:
+        --ckpt-path (str): Path to the model checkpoint directory.
+        --config (str): Path to the model configuration file.
+        --input-file (str, optional): File containing prompts for batch processing.
+        --interactive (bool, optional): Enable interactive mode for generating text.
+        --max-new-tokens (int, optional): Maximum number of new tokens to generate. Defaults to 200.
+        --temperature (float, optional): Temperature for sampling. Defaults to 0.2.
+
+    Raises:
+        AssertionError: If neither input-file nor interactive mode is specified.
+    """
+    parser = ArgumentParser()
+    parser.add_argument("--ckpt-path", type=str, required=True)
+    parser.add_argument("--config", type=str, required=True)
+    parser.add_argument("--input-file", type=str, default="")
+    parser.add_argument("--interactive", action="store_true")
+    parser.add_argument("--max-new-tokens", type=int, default=200)
+    parser.add_argument("--temperature", type=float, default=0.2)
+    args = parser.parse_args()
+    assert args.input_file or args.interactive, "Either input-file or interactive mode must be specified"
+    main(args.ckpt_path, args.config, args.input_file, args.interactive, args.max_new_tokens, args.temperature)

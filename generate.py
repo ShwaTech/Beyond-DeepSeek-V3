@@ -251,7 +251,6 @@ def main(
         max_new_tokens (int): Maximum tokens to generate per prompt.
         temperature (float): Sampling temperature.
     """
-
     # ------------------------------------------------------------
     # 1. Distributed Inference Setup
     #

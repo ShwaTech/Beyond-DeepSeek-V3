@@ -197,7 +197,7 @@ def generate(
         prev_pos = cur_pos
 
         # --------------------------------------------------------
-        # 7.6. Early stopping:
+        # 7. Early stopping:
         #     If ALL sequences have reached EOS, stop generating.
         # --------------------------------------------------------
         if finished.all():

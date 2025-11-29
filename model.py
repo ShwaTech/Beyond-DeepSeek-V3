@@ -1706,3 +1706,155 @@ class MoE(nn.Module):
         # -------------------------------
         return (y + z).view(shape)  # restore original input shape
 
+
+
+class Block(nn.Module):
+    """
+    Transformer block combining attention and feed-forward components.
+
+    This block represents *one layer* of the model's stack.
+    Each block performs:
+
+        1. RMSNorm → Multi-Head Latent Attention (MLA)
+        2. Residual (connection) addition
+        3. RMSNorm → Feed-Forward (Dense MLP or Mixture-of-Experts)
+        4. Residual (connection) addition
+
+    This follows the modern “*Pre-Norm* + Residual” architecture
+    used in LLaMA, Mistral, GPT-NeoX, DeepSeek-V2, etc.
+
+    Attributes:
+        attn (nn.Module):
+            Multi-Head Latent Attention (MLA).
+            Computes contextual mixing across tokens.
+
+        ffn (nn.Module):
+            Position-wise feed-forward transformation.
+            Uses:
+                - Dense MLP for early layers.
+                - MoE for deeper layers (to scale capacity efficiently).
+
+        attn_norm (nn.Module):
+            RMSNorm applied before attention.
+            Stabilizes training and replaces LayerNorm with a lighter & faster alternative.
+
+        ffn_norm (nn.Module):
+            RMSNorm applied before feed-forward.
+    """
+
+    def __init__(self, layer_id: int, args: ModelArgs):
+        """
+        Initializes a single Transformer block.
+
+        Args:
+            layer_id (int):
+                Index of this block in the full model.
+                Used to decide whether to use dense MLP or MoE.
+
+            args (ModelArgs):
+                Contains model-wide hyperparameters such as:
+                    - hidden dimension
+                    - intermediate dimension
+                    - number of MoE layers
+                    - which layers are dense vs MoE
+        """
+        super().__init__()
+
+        # ----------------------------------------------------------
+        # 1. Attention layer
+        # ----------------------------------------------------------
+        # MLA embeds Query/Key projections into a lower latent space
+        # then uses learned re-projection weights to approximate
+        # full attention at much lower memory and compute cost.
+        self.attn = MLA(args)
+
+        # ----------------------------------------------------------
+        # 2. Feed-Forward layer selection
+        # ----------------------------------------------------------
+        # Many modern MoE architectures (e.g., DeepSeek-V2)
+        # use early layers as dense MLPs (stability)
+        # and only switch to MoE in deeper layers (capacity scaling).
+        #
+        # args.n_dense_layers = number of early layers that are dense.
+        # Beyond that, layers use Mixture-of-Experts.
+        if layer_id < args.n_dense_layers:
+            # A classic 2-layer MLP:
+            #    x → W1 → gelu/silu → W2
+            self.ffn = MLP(args.dim, args.inter_dim)
+        else:
+            # A sparse-activated Mixture-of-Experts
+            # (only Top-K experts per token run).
+            self.ffn = MoE(args)
+
+        # ----------------------------------------------------------
+        # 3. Pre-Norm modules
+        # ----------------------------------------------------------
+        # RMSNorm applied *before* sublayers (pre-norm architecture).
+        # Helps with stable gradients, especially for very deep models.
+        self.attn_norm = RMSNorm(args.dim)
+        self.ffn_norm  = RMSNorm(args.dim)
+        # ----------------------------------------------------------
+
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        start_pos: int,
+        freqs_cis: torch.Tensor,
+        mask: Optional[torch.Tensor]
+    ) -> torch.Tensor:
+        """
+        Executes one forward pass through the block.
+
+        Args:
+            x (torch.Tensor):
+                Input tensor of shape [batch, seq, dim].
+                The block processes tokens position-wise.
+
+            start_pos (int):
+                Needed for caching positions in rotary embeddings.
+
+            freqs_cis (torch.Tensor):
+                Precomputed complex rotations for RoPE (rotary embeddings).
+
+            mask (Optional[torch.Tensor]):
+                Attention mask for causal attention or padding.
+
+        Returns:
+            torch.Tensor:
+                Tensor of the same shape as input, after:
+                    Norm → Attention → Residual
+                    Norm → FFN/MoE → Residual
+        """
+        # ----------------------------------------------------------
+        # 1. Attention sublayer (with residual)
+        # ----------------------------------------------------------
+        # Pre-Norm: normalize first, then apply attention.
+        #   Equivalent to: x = x + Attention(Norm(x))
+        #
+        # Motivation:
+        #   - avoids training instability
+        #   - preserves original input scale
+        #   - allows much deeper/efficient training
+        x = x + self.attn(
+                self.attn_norm(x),   # normalized input
+                start_pos,
+                freqs_cis,
+                mask
+            )
+
+        # ----------------------------------------------------------
+        # 2. Feed-Forward sublayer (dense or MoE)
+        # ----------------------------------------------------------
+        # Same pattern as attention:
+        #   x = x + FFN(Norm(x))
+        #
+        # If this layer uses MoE:
+        #   - Gating selects top-K experts
+        #   - Only those experts run
+        #   - Outputs are aggregated and returned
+        x = x + self.ffn(self.ffn_norm(x))
+
+        # Final tensor returned to next block.
+        return x
+

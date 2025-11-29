@@ -1878,3 +1878,175 @@ class Block(nn.Module):
         # Final tensor returned to next block.
         return x
 
+
+
+class Transformer(nn.Module):
+    """
+    Full Transformer language model with:
+        - Parallel token embeddings (vocab sharded across ranks)
+        - Rotary positional embeddings - RoPE (precomputed)
+        - A stack of Transformer blocks (MLA + MLP/MoE)
+        - Final RMS normalization and a parallel LM head (vocab-sharded)
+        - Support for FP8 or BF16 weight storage and distributed tensor/expert parallelism
+
+    This implementation is written to mirror the DeepSeek-V3 style:
+        - Pre-norm residual blocks (RMSNorm before sublayers)
+        - Column/Row parallel linear layers for model parallelism
+        - Optionally uses Mixture-of-Experts (MoE) for high-capacity layers
+        - RoPE (rotary) position information applied in the attention sublayer
+        - Designed for inference (caller uses @torch.inference_mode on forward)
+
+    Attributes:
+        max_seq_len (int): Maximum sequence length for the transformer.
+        embed (nn.Module): Embedding layer for input tokens.
+        layers (torch.nn.ModuleList): List of transformer blocks.
+        norm (nn.Module): Layer normalization applied after all blocks.
+        head (nn.Module): Output projection layer mapping to vocabulary size.
+        freqs_cis (torch.Tensor): Precomputed complex exponential values for rotary embeddings.
+    """
+    def __init__(self, args: ModelArgs):
+        """
+        Initializes the Transformer model.
+
+        Args:
+            args (ModelArgs): configuration object containing:
+                - dim, n_layers, vocab_size, max_seq_len, original_seq_len, ...
+                - dtype ("fp8" or something else), scale_fmt (fp8 scale format)
+                - n_dense_layers (how many initial dense layers before MoE)
+                - mscale, rope_factor, rope_theta, qk_rope_head_dim, etc.
+        """
+        # ---------------------------------------------------------------------
+        # Distributed / global configuration
+        # ---------------------------------------------------------------------
+        # Determine world size & rank for model/expert parallel behavior.
+        # These are used across many modules: ParallelEmbedding, Column/RowParallel,
+        # MoE expert sharding, and final all_gather of logits.
+        global world_size, rank
+        world_size = dist.get_world_size() if dist.is_initialized() else 1
+        rank = dist.get_rank() if dist.is_initialized() else 0
+
+        # ---------------------------------------------------------------------
+        # Global Linear configuration (affects our custom Linear class)
+        # ---------------------------------------------------------------------
+        # Choose weight storage type globally:
+        #  - FP8 (torch.float8_e4m3fn) for maximal memory/bandwidth savings (requires scales)
+        #  - BF16 otherwise (safer default)
+        # The Linear.scale_fmt controls how activation scales are quantized (ue8m0, e4m3, ...).
+        Linear.dtype = torch.float8_e4m3fn if args.dtype == "fp8" else torch.bfloat16
+        Linear.scale_fmt = args.scale_fmt
+
+        super().__init__()
+
+        # ---------------------------------------------------------------------
+        # Model hyperparameters and modules
+        # ---------------------------------------------------------------------
+        # Maximum sequence length the model supports (used for caches, RoPE table).
+        self.max_seq_len = args.max_seq_len
+
+        # ParallelEmbedding: sharded embedding table across ranks (vocab parallelism).
+        # Each rank holds vocab_size/world_size rows; all_reduce reconstructs full embedding outputs.
+        self.embed = ParallelEmbedding(args.vocab_size, args.dim)
+
+        # Stack of transformer blocks (Block contains MLA + MLP/MoE).
+        # We create args.n_layers Block instances, each decides whether its ffn is MLP or MoE
+        # based on layer index and args.n_dense_layers.
+        self.layers = torch.nn.ModuleList()
+        for layer_id in range(args.n_layers):
+            self.layers.append(Block(layer_id, args))
+
+        # Final RMSNorm applied after the last transformer block (pre-head norm).
+        # Matches modern architectures (pre-norm within blocks, final norm separately).
+        self.norm = RMSNorm(args.dim)
+
+        # Output (LM) head: ColumnParallelLinear shards the output logits across ranks.
+        # Each rank computes logits for a shard of the vocabulary; the caller all_gathers them.
+        self.head = ColumnParallelLinear(args.dim, args.vocab_size, dtype=torch.get_default_dtype())
+
+        # Precompute rotary frequencies and store as a buffer for fast lookup.
+        # persistent=False means the buffer won't be saved into checkpoints by default.
+        # freqs_cis shape: (max_seq_len, qk_rope_head_dim/2) in complex representation.
+        self.register_buffer("freqs_cis", precompute_freqs_cis(args), persistent=False)
+
+    @torch.inference_mode()
+    def forward(self, tokens: torch.Tensor, start_pos: int = 0):
+        """
+        Inference-only forward pass returning next-token logits.
+
+        Args:
+            tokens (torch.Tensor): token ids tensor (batch_size, seq_len).
+            start_pos (int): starting absolute position for RoPE indexing (used for caching/generation).
+
+        Returns:
+            torch.Tensor: logits (batch_size, vocab_size)
+                - If model-parallel: this function gathers per-rank shards and returns full logits.
+                - The function returns logits for the last position only (autoregressive LM convention).
+        """
+        # ---------------------------
+        # Basic shapes & embeddings
+        # ---------------------------
+        # seqlen: number of tokens in this call (may be 1 during step-by-step generation)
+        seqlen = tokens.size(1)
+
+        # Embed tokens into continuous vectors.
+        # ParallelEmbedding returns full embedding representation per token (after all_reduce internally).
+        # Shape: (batch, seq_len, dim)
+        h = self.embed(tokens)
+
+        # ---------------------------
+        # Rotary positional slice
+        # ---------------------------
+        # Select the slice of precomputed RoPE frequencies matching the current positions.
+        # For generation with caching, start_pos will increment and we slice an offset window.
+        # freqs_cis shape after slicing: (seqlen, qk_rope_head_dim/2) [broadcast later]
+        freqs_cis = self.freqs_cis[start_pos:start_pos + seqlen]
+
+        # ---------------------------
+        # Causal attention mask (inference/training batch cases)
+        # ---------------------------
+        # If we process more than one token at once, create an upper-triangular mask of -inf
+        # so attention softmax ignores future positions. If seqlen == 1 (single-step generation),
+        # mask is None (no need to mask).
+        mask = None
+        if seqlen > 1:
+            # shape: (seqlen, seqlen) where positions (i,j) with j>i are -inf
+            mask = torch.full((seqlen, seqlen), float("-inf"), device=tokens.device).triu_(1)
+
+        # ---------------------------
+        # Pass through Transformer blocks
+        # ---------------------------
+        # Each block performs:
+        #   x = x + Attn(RMSNorm(x))
+        #   x = x + FFN(RMSNorm(x))  # FFN could be MLP or MoE
+        for layer in self.layers:
+            # layer expects (x, start_pos, freqs_cis, mask)
+            h = layer(h, start_pos, freqs_cis, mask)
+
+        # ---------------------------
+        # Final norm and last-token selection
+        # ---------------------------
+        # Apply final RMSNorm; LM convention returns logits for the last token only.
+        # h becomes shape (batch, dim) after selecting the last position.
+        h = self.norm(h)[:, -1]
+
+        # ---------------------------
+        # Output projection (vocab logits)
+        # ---------------------------
+        # ColumnParallelLinear returns logits for this rank's vocabulary shard.
+        # Shape: (batch, vocab_shard_size)
+        logits = self.head(h)
+
+        # ---------------------------
+        # If we are running model-parallel, gather the shards from all ranks
+        # to form the full vocabulary logits.
+        # ---------------------------
+        if world_size > 1:
+            # Prepare placeholders for all ranks' logits and gather them.
+            all_logits = [torch.empty_like(logits) for _ in range(world_size)]
+            dist.all_gather(all_logits, logits)      # blocking NCCL collect
+            logits = torch.cat(all_logits, dim=-1)   # concatenate shard-wise along vocab axis
+
+        # ---------------------------
+        # Return full logits (batch_size, vocab_size)
+        # ---------------------------
+        return logits
+

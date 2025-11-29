@@ -195,3 +195,14 @@ def main(hf_ckpt_path, save_path, n_experts, mp):
         new_file_path = os.path.join(save_path, os.path.basename(file_path))
         shutil.copyfile(file_path, new_file_path)
 
+
+
+if __name__ == "__main__":
+    parser = ArgumentParser()
+    parser.add_argument("--hf-ckpt-path", type=str, required=True)
+    parser.add_argument("--save-path", type=str, required=True)
+    parser.add_argument("--n-experts", type=int, required=True)
+    parser.add_argument("--model-parallel", type=int, required=True)
+    args = parser.parse_args()
+    assert args.n_experts % args.model_parallel == 0, "Number of experts must be divisible by model parallelism"
+    main(args.hf_ckpt_path, args.save_path, args.n_experts, args.model_parallel)
